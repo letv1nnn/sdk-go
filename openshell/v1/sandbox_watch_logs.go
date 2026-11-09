@@ -13,7 +13,6 @@ import (
 	"github.com/ai-openshell/sdk-go/openshell/v1/types"
 	pb "github.com/ai-openshell/sdk-go/proto/openshellv1"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -28,18 +27,24 @@ const (
 	watchLogsChannelBuffer = 64
 )
 
-// testHookWatchLogsSleep, when set by a test, observes each requested backoff
-// delay. It never waits: watcher.sleep performs the only real, cancellable
-// wait. It is nil in production.
-var testHookWatchLogsSleep func(time.Duration)
-
 // WatchLogs streams a sandbox's log lines and platform events with loss-aware
 // resume.
 //
 // Each delivered event carries an opaque cursor. The watcher tracks the highest
 // cursor it has seen, reconnects transparently on transient stream errors, and
 // asks the gateway to replay only what follows that cursor, so a reconnect
-// neither loses nor duplicates events.
+// neither loses nor duplicates events. This relies on the gateway delivering
+// live log and platform events in cursor order across both sources, which it
+// guarantees by merging them and withholding any event above its publication
+// watermark.
+//
+// Only gRPC Unavailable (a dropped connection or gateway restart) is retried,
+// with capped exponential backoff, and it is retried indefinitely: no event is
+// emitted while the watcher reconnects, so a gateway that stays down looks
+// like a quiet sandbox. Bound the watch with a context deadline or call Stop
+// when that matters. This differs from Watch, which reports Unavailable as an
+// ERROR event immediately. A connection that dies without the transport
+// noticing (no keepalive, half-open TCP) stalls until the context ends.
 //
 // Loss is never silent. A recoverable server-side gap arrives as a
 // WatchLogKindWarning event and the stream continues. An unrecoverable gap ends
@@ -109,7 +114,7 @@ func (s *sandboxClient) runWatchLogs(ctx context.Context, w *watcher[*WatchLogEv
 
 		stream, err := s.client.WatchSandbox(ctx, req)
 		if err != nil {
-			if !retryWatchLogs(ctx, w, err, &backoff) {
+			if !s.retryWatchLogs(ctx, w, err, &backoff) {
 				return
 			}
 			continue
@@ -123,7 +128,7 @@ func (s *sandboxClient) runWatchLogs(ctx context.Context, w *watcher[*WatchLogEv
 					// Server closed the stream cleanly; nothing left to resume.
 					return
 				}
-				reconnect = retryWatchLogs(ctx, w, recvErr, &backoff)
+				reconnect = s.retryWatchLogs(ctx, w, recvErr, &backoff)
 				break
 			}
 
@@ -137,11 +142,13 @@ func (s *sandboxClient) runWatchLogs(ctx context.Context, w *watcher[*WatchLogEv
 			// stream and then drops it would otherwise be redialed at the
 			// initial delay forever.
 			backoff = watchLogsInitialBackoff
-			// The gateway reads the log and platform sources independently
-			// during live delivery, so arrival order can differ from cursor
-			// order. Keep the high-water mark: assigning directly would let a
-			// later lower cursor rewind the resume point and replay
-			// already-delivered events after a reconnect.
+			// The gateway delivers log and platform events in cursor order
+			// across both sources: it merges what each source has queued and
+			// withholds anything above its publication watermark, so a
+			// higher cursor is never sent ahead of a lower one still in
+			// flight. Comparing instead of assigning is defensive: the proto
+			// contract is to keep the greater cursor, and a rewind would
+			// replay already-delivered events after a reconnect.
 			if item.Cursor > cursor {
 				cursor = item.Cursor
 			}
@@ -159,7 +166,7 @@ func (s *sandboxClient) runWatchLogs(ctx context.Context, w *watcher[*WatchLogEv
 // the caller should redial from the tracked cursor, having already waited out
 // the backoff and doubled it. Otherwise the error is terminal: it is reported
 // as an ERROR event (unless the consumer already stopped) and the watch ends.
-func retryWatchLogs(ctx context.Context, w *watcher[*WatchLogEvent], err error, backoff *time.Duration) bool {
+func (s *sandboxClient) retryWatchLogs(ctx context.Context, w *watcher[*WatchLogEvent], err error, backoff *time.Duration) bool {
 	if w.stopped() || ctx.Err() != nil {
 		return false
 	}
@@ -170,24 +177,27 @@ func retryWatchLogs(ctx context.Context, w *watcher[*WatchLogEvent], err error, 
 		w.emit(ctx, Event[*WatchLogEvent]{Type: EventError, Err: converted})
 		return false
 	}
-	if testHookWatchLogsSleep != nil {
-		testHookWatchLogsSleep(*backoff)
+	wait := w.sleep
+	if s.watchLogsWait != nil {
+		wait = func(ctx context.Context, d time.Duration) bool { return s.watchLogsWait(ctx, w, d) }
 	}
-	if !w.sleep(ctx, *backoff) {
+	if !wait(ctx, *backoff) {
 		return false
 	}
 	*backoff = min(*backoff*2, watchLogsMaxBackoff)
 	return true
 }
 
-// isRetryableWatchLogsError reports whether a stream error is a transient
-// condition worth reconnecting on. Only Unavailable (connection drop, gateway
-// restart) qualifies; every other status is surfaced to the caller instead of
+// isRetryableWatchLogsError reports whether a converted stream error is a
+// transient condition worth reconnecting on. Only gRPC Unavailable (connection
+// drop, gateway restart) qualifies. It checks the raw gRPC code, not the SDK
+// ErrorCode, because ResourceExhausted also maps to ErrorUnavailable and must
+// not be redialed. Every other status is surfaced to the caller instead of
 // looping.
 func isRetryableWatchLogsError(err error) bool {
 	var se *types.StatusError
 	if errors.As(err, &se) {
 		return se.GRPCCode == int32(codes.Unavailable)
 	}
-	return status.Code(err) == codes.Unavailable
+	return false
 }

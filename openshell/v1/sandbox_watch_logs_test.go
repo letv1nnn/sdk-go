@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -51,6 +52,29 @@ func platformEvent(cursor, reason string) *pb.SandboxStreamEvent {
 func warningEvent(message string) *pb.SandboxStreamEvent {
 	return &pb.SandboxStreamEvent{
 		Payload: &pb.SandboxStreamEvent_Warning{Warning: &pb.SandboxStreamWarning{Message: message}},
+	}
+}
+
+// observeWatchLogsBackoff records every reconnect backoff the client requests.
+// With wait false the delay is skipped, so a test can drive many retries
+// instantly; with wait true the watcher still performs its real, cancellable
+// wait. The returned func snapshots the recorded delays.
+func observeWatchLogsBackoff(c *sandboxClient, wait bool) func() []time.Duration {
+	var mu sync.Mutex
+	var delays []time.Duration
+	c.watchLogsWait = func(ctx context.Context, w *watcher[*WatchLogEvent], d time.Duration) bool {
+		mu.Lock()
+		delays = append(delays, d)
+		mu.Unlock()
+		if wait {
+			return w.sleep(ctx, d)
+		}
+		return !w.stopped() && ctx.Err() == nil
+	}
+	return func() []time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Duration(nil), delays...)
 	}
 }
 
@@ -174,6 +198,8 @@ func TestWatchLogs_RequestFields(t *testing.T) {
 	req := mock.watchRequest
 	mock.mu.Unlock()
 	require.NotNil(t, req)
+	assert.Equal(t, "sb-1", req.GetSandbox())
+	assert.Equal(t, "default", req.GetWorkspaceScope().GetWorkspace())
 	assert.False(t, req.GetFollowStatus())
 	assert.True(t, req.GetFollowLogs())
 	assert.True(t, req.GetFollowEvents())
@@ -225,6 +251,10 @@ func TestWatchLogs_ReconnectResumesFromHighestCursor(t *testing.T) {
 	w, err := client.WatchLogs(context.Background(), "default", "sb-1", WatchLogsOptions{
 		FollowLogs:   true,
 		FollowEvents: true,
+		LogSources:   []string{"sandbox", "gateway"},
+		LogMinLevel:  "INFO",
+		LogTailLines: 10,
+		EventTail:    3,
 	})
 	require.NoError(t, err)
 	defer w.Stop()
@@ -244,12 +274,17 @@ func TestWatchLogs_ReconnectResumesFromHighestCursor(t *testing.T) {
 	require.Len(t, requests, 2)
 	assert.Empty(t, requests[0].GetResumeAfterCursor())
 	assert.Equal(t, "0000000003", requests[1].GetResumeAfterCursor())
+
+	// The redial must rebuild the same request, changing only the cursor.
+	want := proto.Clone(requests[0]).(*pb.WatchSandboxRequest)
+	want.ResumeAfterCursor = "0000000003"
+	assert.True(t, proto.Equal(want, requests[1]), "redial request differs beyond the cursor:\nwant %v\ngot  %v", want, requests[1])
 }
 
 func TestWatchLogs_CursorIsHighWaterMark(t *testing.T) {
-	// The gateway reads the log and platform sources independently during live
-	// delivery, so a lower cursor can arrive after a higher one. The resume
-	// point must not rewind.
+	// The gateway delivers events in cursor order, but the SDK must still never
+	// rewind its resume point if a lower cursor arrives after a higher one, as
+	// the proto contract says to keep the greater cursor.
 	mock := watchLogsMock()
 	mock.watchFunc = func(attempt int, _ *pb.WatchSandboxRequest, stream grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
 		if attempt == 0 {
@@ -346,26 +381,39 @@ func TestWatchLogs_OutOfRangeIsTerminal(t *testing.T) {
 }
 
 func TestWatchLogs_NonRetryableErrorIsTerminal(t *testing.T) {
-	mock := watchLogsMock()
-	mock.watchFunc = func(_ int, _ *pb.WatchSandboxRequest, _ grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
-		return status.Error(codes.PermissionDenied, "nope")
+	// ResourceExhausted maps to ErrorUnavailable in the SDK, but it must not be
+	// redialed: the retry decision uses the raw gRPC code.
+	for _, code := range []codes.Code{
+		codes.PermissionDenied,
+		codes.Unauthenticated,
+		codes.ResourceExhausted,
+		codes.Internal,
+	} {
+		t.Run(code.String(), func(t *testing.T) {
+			mock := watchLogsMock()
+			mock.watchFunc = func(_ int, _ *pb.WatchSandboxRequest, _ grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
+				return status.Error(code, "nope")
+			}
+			client, cleanup := setupSandboxTest(t, mock)
+			defer cleanup()
+
+			w, err := client.WatchLogs(context.Background(), "default", "sb-1")
+			require.NoError(t, err)
+			defer w.Stop()
+
+			events := drainWatchLogs(t, w)
+			require.Len(t, events, 1)
+			assert.Equal(t, EventError, events[0].Type)
+			var se *StatusError
+			require.ErrorAs(t, events[0].Err, &se)
+			assert.Equal(t, int32(code), se.GRPCCode)
+
+			mock.mu.Lock()
+			attempts := len(mock.watchRequests)
+			mock.mu.Unlock()
+			assert.Equal(t, 1, attempts, "%s must not be retried", code)
+		})
 	}
-	client, cleanup := setupSandboxTest(t, mock)
-	defer cleanup()
-
-	w, err := client.WatchLogs(context.Background(), "default", "sb-1")
-	require.NoError(t, err)
-	defer w.Stop()
-
-	events := drainWatchLogs(t, w)
-	require.Len(t, events, 1)
-	assert.Equal(t, EventError, events[0].Type)
-	assert.True(t, IsPermissionDenied(events[0].Err))
-
-	mock.mu.Lock()
-	attempts := len(mock.watchRequests)
-	mock.mu.Unlock()
-	assert.Equal(t, 1, attempts)
 }
 
 func TestWatchLogs_BackoffResetsAfterDeliveredEvent(t *testing.T) {
@@ -373,19 +421,6 @@ func TestWatchLogs_BackoffResetsAfterDeliveredEvent(t *testing.T) {
 	// backoff, not an escalating one.
 	const attempts = 3
 	mock := watchLogsMock()
-	var recordedBackoffs []time.Duration
-	var mu sync.Mutex
-
-	// Record each requested backoff delay. The hook only observes; the watcher
-	// still waits out the real delay.
-	oldHook := testHookWatchLogsSleep
-	testHookWatchLogsSleep = func(d time.Duration) {
-		mu.Lock()
-		recordedBackoffs = append(recordedBackoffs, d)
-		mu.Unlock()
-	}
-	defer func() { testHookWatchLogsSleep = oldHook }()
-
 	mock.watchFunc = func(attempt int, _ *pb.WatchSandboxRequest, stream grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
 		if attempt >= attempts-1 {
 			return nil
@@ -397,6 +432,7 @@ func TestWatchLogs_BackoffResetsAfterDeliveredEvent(t *testing.T) {
 	}
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
+	backoffs := observeWatchLogsBackoff(client, false)
 
 	w, err := client.WatchLogs(context.Background(), "default", "sb-1")
 	require.NoError(t, err)
@@ -406,9 +442,7 @@ func TestWatchLogs_BackoffResetsAfterDeliveredEvent(t *testing.T) {
 	require.Len(t, events, attempts-1)
 
 	// Both backoff requests should be at the initial delay (reset between drops).
-	require.Len(t, recordedBackoffs, 2)
-	assert.Equal(t, watchLogsInitialBackoff, recordedBackoffs[0])
-	assert.Equal(t, watchLogsInitialBackoff, recordedBackoffs[1])
+	assert.Equal(t, []time.Duration{watchLogsInitialBackoff, watchLogsInitialBackoff}, backoffs())
 }
 
 func TestWatchLogs_BackoffGrowsWhenOnlySnapshotsArrive(t *testing.T) {
@@ -417,16 +451,6 @@ func TestWatchLogs_BackoffGrowsWhenOnlySnapshotsArrive(t *testing.T) {
 	// growing instead of resetting on each attempt.
 	const attempts = 4
 	mock := watchLogsMock()
-	var recordedBackoffs []time.Duration
-	var mu sync.Mutex
-
-	oldHook := testHookWatchLogsSleep
-	testHookWatchLogsSleep = func(d time.Duration) {
-		mu.Lock()
-		recordedBackoffs = append(recordedBackoffs, d)
-		mu.Unlock()
-	}
-	defer func() { testHookWatchLogsSleep = oldHook }()
 
 	mock.watchFunc = func(attempt int, _ *pb.WatchSandboxRequest, stream grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
 		if attempt >= attempts-1 {
@@ -443,6 +467,7 @@ func TestWatchLogs_BackoffGrowsWhenOnlySnapshotsArrive(t *testing.T) {
 	}
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
+	backoffs := observeWatchLogsBackoff(client, false)
 
 	w, err := client.WatchLogs(context.Background(), "default", "sb-1")
 	require.NoError(t, err)
@@ -450,13 +475,44 @@ func TestWatchLogs_BackoffGrowsWhenOnlySnapshotsArrive(t *testing.T) {
 
 	assert.Empty(t, drainWatchLogs(t, w))
 
-	mu.Lock()
-	defer mu.Unlock()
 	assert.Equal(t, []time.Duration{
 		watchLogsInitialBackoff,
 		2 * watchLogsInitialBackoff,
 		4 * watchLogsInitialBackoff,
-	}, recordedBackoffs)
+	}, backoffs())
+}
+
+func TestWatchLogs_BackoffCapsAtMax(t *testing.T) {
+	// A gateway that stays unavailable must be redialed at the capped delay,
+	// not at an ever-growing one.
+	const retries = 8
+	mock := watchLogsMock()
+	mock.watchFunc = func(attempt int, _ *pb.WatchSandboxRequest, _ grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
+		if attempt >= retries {
+			return nil
+		}
+		return status.Error(codes.Unavailable, "gateway down")
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+	backoffs := observeWatchLogsBackoff(client, false)
+
+	w, err := client.WatchLogs(context.Background(), "default", "sb-1")
+	require.NoError(t, err)
+	defer w.Stop()
+
+	assert.Empty(t, drainWatchLogs(t, w))
+
+	assert.Equal(t, []time.Duration{
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+		800 * time.Millisecond,
+		1600 * time.Millisecond,
+		watchLogsMaxBackoff,
+		watchLogsMaxBackoff,
+		watchLogsMaxBackoff,
+	}, backoffs())
 }
 
 func TestWatchLogs_BackoffWaitsOncePerRetry(t *testing.T) {
@@ -498,21 +554,23 @@ func TestWatchLogs_StopInterruptsBackoff(t *testing.T) {
 	// unavailable.
 	const longBackoff = 8 * watchLogsInitialBackoff
 	mock := watchLogsMock()
-	inLongBackoff := make(chan struct{})
-	var once sync.Once
-	oldHook := testHookWatchLogsSleep
-	testHookWatchLogsSleep = func(d time.Duration) {
-		if d >= longBackoff {
-			once.Do(func() { close(inLongBackoff) })
-		}
-	}
-	defer func() { testHookWatchLogsSleep = oldHook }()
-
 	mock.watchFunc = func(int, *pb.WatchSandboxRequest, grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
 		return status.Error(codes.Unavailable, "gateway down")
 	}
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
+
+	// Skip the short delays, then perform the first long one for real so Stop
+	// has a backoff to interrupt.
+	inLongBackoff := make(chan struct{})
+	var once sync.Once
+	client.watchLogsWait = func(ctx context.Context, w *watcher[*WatchLogEvent], d time.Duration) bool {
+		if d < longBackoff {
+			return !w.stopped() && ctx.Err() == nil
+		}
+		once.Do(func() { close(inLongBackoff) })
+		return w.sleep(ctx, d)
+	}
 
 	w, err := client.WatchLogs(context.Background(), "default", "sb-1")
 	require.NoError(t, err)
@@ -550,15 +608,10 @@ func TestWatchLogs_StopClosesChannel(t *testing.T) {
 	assert.Equal(t, "hello", ev.Object.Log.Message)
 
 	w.Stop()
-	select {
-	case _, ok := <-w.ResultChan():
-		if ok {
-			// A queued event may still drain before the close.
-			_, ok = <-w.ResultChan()
-		}
-		assert.False(t, ok, "channel should close after Stop")
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for channel close after Stop")
+	// Nothing further is queued, and Stop must not surface the cancelled
+	// stream as an ERROR event.
+	for _, ev := range drainWatchLogs(t, w) {
+		assert.NotEqual(t, EventError, ev.Type, "Stop must not emit an error: %v", ev.Err)
 	}
 }
 
@@ -576,7 +629,9 @@ func TestWatchLogs_ContextCancelClosesChannel(t *testing.T) {
 	defer w.Stop()
 
 	cancel()
-	drainWatchLogs(t, w)
+	// The mock sends nothing, and cancellation must not surface the
+	// cancelled stream as an ERROR event.
+	assert.Empty(t, drainWatchLogs(t, w))
 }
 
 func TestWatchLogs_EmptyName(t *testing.T) {
