@@ -20,11 +20,18 @@ const defaultPollInterval = 500 * time.Millisecond
 
 type sandboxClient struct {
 	client pb.OpenShellClient
+
+	// watchLogsWait, when non-nil, replaces the WatchLogs reconnect backoff
+	// wait. It must return false when the watcher was stopped or ctx ended.
+	// Tests set it per client to observe or skip the delay; nil uses
+	// watcher.sleep.
+	watchLogsWait func(ctx context.Context, w *watcher[*WatchLogEvent], d time.Duration) bool
 }
 
 var _ SandboxInterface = (*sandboxClient)(nil)
 var _ SandboxTemplateCreateInterface = (*sandboxClient)(nil)
 var _ SandboxSuspendResumeInterface = (*sandboxClient)(nil)
+var _ SandboxLogsWatchInterface = (*sandboxClient)(nil)
 
 func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}

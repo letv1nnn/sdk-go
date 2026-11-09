@@ -118,8 +118,15 @@ type SandboxInterface interface {
 	WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
-	WatchLogs(ctx context.Context, workspace, name string, opts ...WatchLogsOptions) (WatchInterface[*WatchLogEvent], error)
 	GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error)
+}
+
+// SandboxLogsWatchInterface defines resumable log and platform event watching
+// without widening SandboxInterface.
+type SandboxLogsWatchInterface interface {
+	// WatchLogs streams a sandbox's log lines and platform events with
+	// loss-aware resume. See sandboxClient.WatchLogs for the full contract.
+	WatchLogs(ctx context.Context, workspace, name string, opts ...WatchLogsOptions) (WatchInterface[*WatchLogEvent], error)
 }
 
 // SandboxTemplateCreateInterface defines additive sandbox creation from named

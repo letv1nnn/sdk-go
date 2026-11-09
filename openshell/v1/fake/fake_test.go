@@ -116,6 +116,7 @@ func TestFakeClient_SubClients(t *testing.T) {
 	fc := NewClient()
 
 	assert.NotNil(t, fc.Sandboxes())
+	assert.NotNil(t, fc.SandboxLogsWatch())
 	assert.NotNil(t, fc.Providers())
 	assert.NotNil(t, fc.Exec())
 	assert.NotNil(t, fc.Files())

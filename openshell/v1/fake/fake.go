@@ -26,6 +26,7 @@ type Client struct {
 	sandboxes      v1.SandboxInterface
 	templateCreate v1.SandboxTemplateCreateInterface
 	suspendResume  v1.SandboxSuspendResumeInterface
+	logsWatch      v1.SandboxLogsWatchInterface
 	templates      v1.SandboxTemplateInterface
 	providers      v1.ProviderInterface
 	services       v1.ServiceInterface
@@ -86,6 +87,7 @@ func NewClient(opts ...ClientOption) *Client {
 	fc.sandboxes = sandboxes
 	fc.templateCreate = sandboxes
 	fc.suspendResume = sandboxes
+	fc.logsWatch = sandboxes
 	fc.templates = newFakeSandboxTemplateClient(fc.templateStore, fc.isClosed)
 	fc.providers = newFakeProviderClient(fc.providerStore, fc.isClosed)
 	fc.services = newFakeServiceClient(fc.isClosed)
@@ -126,6 +128,11 @@ func (fc *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name
 // SandboxSuspendResume returns the sandbox suspend and resume sub-client.
 func (fc *Client) SandboxSuspendResume() v1.SandboxSuspendResumeInterface {
 	return fc.suspendResume
+}
+
+// SandboxLogsWatch returns the resumable sandbox log and event watch sub-client.
+func (fc *Client) SandboxLogsWatch() v1.SandboxLogsWatchInterface {
+	return fc.logsWatch
 }
 
 // Providers returns the provider sub-client.

@@ -293,6 +293,7 @@ type fakeSandboxClient struct {
 var _ v1.SandboxInterface = (*fakeSandboxClient)(nil)
 var _ v1.SandboxTemplateCreateInterface = (*fakeSandboxClient)(nil)
 var _ v1.SandboxSuspendResumeInterface = (*fakeSandboxClient)(nil)
+var _ v1.SandboxLogsWatchInterface = (*fakeSandboxClient)(nil)
 
 // newFakeSandboxClient creates a new fakeSandboxClient.
 func newFakeSandboxClient(

@@ -321,6 +321,7 @@ stream completion.
 | File transfer API (transport capability-gated) | `FileInterface` | [Files](https://ai-openshell.github.io/sdk-go/api/files.html) |
 | Policy management (draft review, approve, reject, merge, global policy) | `PolicyInterface` | [Policy](https://ai-openshell.github.io/sdk-go/api/policy.html) |
 | Sandbox logs (streaming retrieval) | `SandboxInterface` | [Sandboxes](https://ai-openshell.github.io/sdk-go/api/sandboxes.html) |
+| Resumable log and platform event watch (loss-aware reconnect) | `SandboxLogsWatchInterface` | [Sandboxes](https://ai-openshell.github.io/sdk-go/api/sandboxes.html) |
 | Workspace management (create, get, list, delete, members) | `WorkspaceInterface` | [Workspaces](https://ai-openshell.github.io/sdk-go/api/workspaces.html) |
 | Sandbox provider attachment (attach, detach, list) | `SandboxInterface` | [Sandboxes](https://ai-openshell.github.io/sdk-go/api/sandboxes.html) |
 | Gateway info and current user identity | `HealthInterface` | [Health](https://ai-openshell.github.io/sdk-go/api/health.html) |
