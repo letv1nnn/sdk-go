@@ -25,10 +25,11 @@ const (
 	ErrorUnimplemented
 	ErrorConflict
 	ErrorUnauthenticated
-	// ErrorOutOfRange reports unrecoverable loss on a resumable stream: the
-	// requested resume cursor is no longer available, so the events after it
-	// cannot be replayed. Distinct from ErrorInvalidArgument because the
-	// request was well formed.
+	// ErrorOutOfRange mirrors gRPC OUT_OF_RANGE: the operation was attempted
+	// past a valid range, such as a read or seek beyond the end of a resource.
+	// Unlike ErrorInvalidArgument, the request was well formed and may succeed
+	// against a different state. Each operation documents what the range is;
+	// for WatchLogs it means the resume cursor is gone.
 	ErrorOutOfRange
 )
 
@@ -151,8 +152,9 @@ func IsUnauthenticated(err error) bool {
 	return hasCode(err, ErrorUnauthenticated)
 }
 
-// IsOutOfRange returns true if the error indicates a resume cursor is no
-// longer available and the events after it are unrecoverable.
+// IsOutOfRange returns true if the error indicates an operation was attempted
+// past a valid range (gRPC OUT_OF_RANGE). On WatchLogs it means the resume
+// cursor is no longer available and the events after it are unrecoverable.
 func IsOutOfRange(err error) bool {
 	return hasCode(err, ErrorOutOfRange)
 }

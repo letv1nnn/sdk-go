@@ -268,7 +268,11 @@ for event := range watcher.ResultChan() {
 
 Streams a sandbox's log lines and platform events with loss-aware resume. Returns a `WatchInterface[*WatchLogEvent]`.
 
-Each delivered item carries an opaque `Cursor`. The watcher tracks the highest cursor it has seen, reconnects transparently when the stream drops, and asks the gateway to replay only what follows that cursor, so a reconnect neither loses nor duplicates events.
+`WatchLogs` lives on the optional `SandboxLogsWatchInterface`, reached through `client.SandboxLogsWatch()`, so `SandboxInterface` stays unchanged for existing mocks and wrappers.
+
+Each delivered item carries an opaque `Cursor`. The watcher tracks the highest cursor it has seen, reconnects transparently when the stream drops, and asks the gateway to replay only what follows that cursor, so a reconnect neither loses nor duplicates events. The gateway delivers live log and platform events in cursor order across both sources, which is what makes the highest cursor a safe resume point.
+
+Only gRPC `Unavailable` (a dropped connection or gateway restart) is retried, with exponential backoff from 100ms capped at 2s, and it is retried indefinitely. Nothing is emitted while the watcher reconnects, so a gateway that stays down looks the same as a quiet sandbox. Bound the watch with a context deadline, or call `Stop`, when that matters. This differs from `Watch`, which reports `Unavailable` as an `EventError` immediately. Every other error ends the stream with an `EventError`.
 
 Every `Event[*WatchLogEvent]` has `Type` `EventAdded`, except a terminal failure, which arrives as `EventError` with `Err` set and no `Object`. The `Object.Kind` field selects the populated payload:
 
@@ -291,7 +295,7 @@ Every `Event[*WatchLogEvent]` has `Type` `EventAdded`, except a terminal failure
 | `EventTail uint32` | Bound the initial event backfill. Ignored when resuming from a cursor |
 
 ```go
-watcher, err := client.Sandboxes().WatchLogs(ctx, "default", "my-sandbox", v1.WatchLogsOptions{
+watcher, err := client.SandboxLogsWatch().WatchLogs(ctx, "default", "my-sandbox", v1.WatchLogsOptions{
     FollowLogs:   true,
     FollowEvents: true,
     LogTailLines: 100,
@@ -329,7 +333,7 @@ Loss is never silent. A recoverable gap arrives as a `WatchLogKindWarning` item 
 Persist the highest cursor to resume across process restarts:
 
 ```go
-watcher, err := client.Sandboxes().WatchLogs(ctx, "default", "my-sandbox", v1.WatchLogsOptions{
+watcher, err := client.SandboxLogsWatch().WatchLogs(ctx, "default", "my-sandbox", v1.WatchLogsOptions{
     FollowLogs:        true,
     ResumeAfterCursor: savedCursor,
 })

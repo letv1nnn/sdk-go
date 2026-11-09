@@ -42,7 +42,9 @@ Use these top-level functions to check error types. They work with wrapped error
 | `v1.IsInvalidArgument` | `ErrorInvalidArgument` | Invalid request parameters                  |
 | `v1.IsDeadlineExceeded` | `ErrorDeadlineExceeded` | Operation timed out                       |
 | `v1.IsCancelled`     | `ErrorCancelled`     | Operation was cancelled (context cancellation)   |
-| `v1.IsOutOfRange`    | `ErrorOutOfRange`    | A stream resume cursor is gone and the events after it are unrecoverable |
+| `v1.IsOutOfRange`    | `ErrorOutOfRange`    | Operation attempted past a valid range (gRPC `OUT_OF_RANGE`). On `WatchLogs`, the resume cursor is gone and the events after it are unrecoverable |
+
+gRPC `OUT_OF_RANGE` maps to `ErrorOutOfRange` on every RPC. Earlier releases mapped it to `ErrorInvalidArgument`, so code that matched `IsInvalidArgument` for an out-of-range result should match `IsOutOfRange` instead.
 
 For `ErrorInternal` (server-side errors), no convenience predicate exists. Match it directly via the `Code` field:
 
