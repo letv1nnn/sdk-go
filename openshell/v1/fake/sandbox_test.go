@@ -1008,6 +1008,25 @@ func TestSandbox_GetLogs_ClosedReturnsUnavailable(t *testing.T) {
 	assert.True(t, types.IsUnavailable(err))
 }
 
+func TestSandbox_WatchLogs_ReturnsUnimplemented(t *testing.T) {
+	sc := newTestSandboxClient()
+	w, err := sc.WatchLogs(context.Background(), "default", "sb-1")
+	require.Error(t, err)
+	assert.Nil(t, w)
+	assert.True(t, types.IsUnimplemented(err))
+}
+
+func TestSandbox_WatchLogs_ClosedReturnsUnavailable(t *testing.T) {
+	store := newobjectStore(sandboxName, copySandbox)
+	templateStore := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
+	broadcaster := newWatchBroadcaster[*types.Sandbox]()
+	sc := newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return true })
+	w, err := sc.WatchLogs(context.Background(), "default", "sb-1")
+	require.Error(t, err)
+	assert.Nil(t, w)
+	assert.True(t, types.IsUnavailable(err))
+}
+
 func TestSandbox_SuspendAndResume(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
